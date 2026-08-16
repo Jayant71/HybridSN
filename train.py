@@ -6,6 +6,7 @@ from operator import truediv
 
 import hydra
 import numpy as np
+import spectral
 import torch
 import torchinfo
 from hydra.core.hydra_config import HydraConfig
@@ -280,6 +281,19 @@ def predictModel(model, loader, criterion=None):
     return y_true, y_pred, test_loss
 
 
+def plot_outputs(y_true, y_pred, path):
+    spectral.save_rgb(
+        os.path.join(path, "ground_truth.png"),
+        y_true,
+        colors=spectral.spy_colors,
+    )
+    spectral.save_rgb(
+        os.path.join(path, "predicted.png"),
+        y_pred,
+        colors=spectral.spy_colors,
+    )
+
+
 # %% Train the model
 def trainModel(
     model,
@@ -298,7 +312,7 @@ def trainModel(
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: decay_rate ** (step / decay_steps)
     )
-    best = {"train_loss": 0, "test_loss": 0, "oa": 0, "aa": 0, "kappa": 0}
+    best = {"train_loss": 0.0, "test_loss": 0.0, "oa": 0.0, "aa": 0.0, "kappa": 0.0}
     for epoch in range(epochs):
         model.train()
         running_loss, n = 0.0, 0
@@ -352,12 +366,14 @@ def main(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}")
 
-    data, _ = applyPCA(data, numComponents=config.train.pca_components)
+    data_pca, _ = applyPCA(data, numComponents=config.train.pca_components)
 
-    data, labels = createImageCubes(data, labels, windowSize=config.train.window_size)
+    patches_data, patches_labels = createImageCubes(
+        data_pca, labels, windowSize=config.train.window_size
+    )
 
     X_train, X_test, y_train, y_test = splitTrainTestSet(
-        data, labels, config.train.test_ratio, config.train.random_state
+        patches_data, patches_labels, config.train.test_ratio, config.train.random_state
     )
     log.info(
         f"Split data into train and test sets with shapes: X_train: {X_train.shape}, X_test: {X_test.shape}, y_train: {y_train.shape}, y_test: {y_test.shape}"
@@ -437,6 +453,39 @@ def main(config):
         model, test_loader, criterion=nn.CrossEntropyLoss()
     )
     metrics = reports(y_true, y_pred, dataset_name, test_loss=test_loss)
+
+    full_patches, _ = createImageCubes(
+        data_pca, labels, windowSize=config.train.window_size, removeZeroLabels=False
+    )
+    full_patches = full_patches.reshape(
+        -1,
+        config.train.window_size,
+        config.train.window_size,
+        config.train.pca_components,
+        1,
+    )
+    full_patches = (
+        torch.tensor(full_patches, dtype=torch.float32)
+        .to(device)
+        .permute(0, 4, 3, 1, 2)
+    )
+    full_loader = DataLoader(
+        TensorDataset(
+            full_patches, torch.zeros(full_patches.size(0), dtype=torch.long).to(device)
+        ),
+        batch_size=256,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+    )
+    _, full_pred, _ = predictModel(model, full_loader)
+    predicted_map = full_pred.reshape(labels.shape) + 1
+    predicted_map[labels == 0] = 0
+    plot_outputs(
+        labels,
+        predicted_map,
+        path=os.path.join(HydraConfig.get().runtime.output_dir),
+    )
 
     summary = "\n".join(
         [
