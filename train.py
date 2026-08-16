@@ -1,4 +1,5 @@
 # %% Import libraries
+import logging
 import os
 import warnings
 from operator import truediv
@@ -6,7 +7,7 @@ from operator import truediv
 import hydra
 import numpy as np
 import torch
-import torch.nn as nn
+import torchinfo
 from hydra.core.hydra_config import HydraConfig
 from scipy import io as sio
 from sklearn.decomposition import PCA
@@ -17,10 +18,13 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.model_selection import train_test_split
+from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+log = logging.getLogger(__name__)
 
 
 # %% Load data
@@ -101,7 +105,7 @@ def createImageCubes(X, y, windowSize=5, removeZeroLabels=True):
 
 class HybridSN(nn.Module):
     def __init__(self, S, L, out):
-        super(HybridSN, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv3d(in_channels=1, out_channels=8, kernel_size=(7, 3, 3))
 
         self.conv2 = nn.Conv3d(in_channels=8, out_channels=16, kernel_size=(5, 3, 3))
@@ -270,8 +274,8 @@ def predictModel(model, loader, criterion=None):
             targets.append(y_batch)
             n += X_batch.size(0)
 
-    y_true = torch.cat(targets).numpy()
-    y_pred = torch.cat(preds).numpy()
+    y_true = torch.cat(targets).to("cpu").numpy()
+    y_pred = torch.cat(preds).to("cpu").numpy()
     test_loss = loss_sum / n if criterion is not None else None
     return y_true, y_pred, test_loss
 
@@ -294,7 +298,7 @@ def trainModel(
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: decay_rate ** (step / decay_steps)
     )
-
+    best = {"train_loss": 0, "test_loss": 0, "oa": 0, "aa": 0, "kappa": 0}
     for epoch in range(epochs):
         model.train()
         running_loss, n = 0.0, 0
@@ -309,12 +313,31 @@ def trainModel(
             n += X_batch.size(0)
         y_true, y_pred, test_loss = predictModel(model, test_loader, criterion)
         metrics = computeMetrics(y_true, y_pred, dataset_name)
+        if metrics["oa"] > best["oa"]:
+            best["train_loss"] = running_loss / n
+            best["test_loss"] = test_loss
+            best["oa"] = metrics["oa"]
+            best["aa"] = metrics["aa"]
+            best["kappa"] = metrics["kappa"]
+            torch.save(
+                model.state_dict(),
+                os.path.join(
+                    HydraConfig.get().runtime.output_dir,
+                    f"model_best_{dataset_name}.pth",
+                ),
+            )
         tqdm.write(
             f"Epoch [{epoch + 1}/{epochs}] "
             f"loss {running_loss / n:.4f} | test loss {test_loss:.4f} | "
             f"OA {metrics['oa']:.2f}% | AA {metrics['aa']:.2f}% | "
             f"Kappa {metrics['kappa']:.2f}% | LR {lr_scheduler.get_last_lr()[0]:.3e}"
         )
+    torch.save(
+        model.state_dict(),
+        os.path.join(
+            HydraConfig.get().runtime.output_dir, f"model_{dataset_name}_{epochs}.pth"
+        ),
+    )
 
 
 # %% Main function
@@ -323,9 +346,11 @@ def main(config):
     torch.manual_seed(config.train.random_seed)
     dataset_name = config.train.dataset
     data, labels = loadData(dataset_name)
-    print(
+    log.info(
         f"Loaded {dataset_name} dataset with shape: {data.shape} and labels shape: {labels.shape}"
     )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Using device: {device}")
 
     data, _ = applyPCA(data, numComponents=config.train.pca_components)
 
@@ -334,7 +359,7 @@ def main(config):
     X_train, X_test, y_train, y_test = splitTrainTestSet(
         data, labels, config.train.test_ratio, config.train.random_state
     )
-    print(
+    log.info(
         f"Split data into train and test sets with shapes: X_train: {X_train.shape}, X_test: {X_test.shape}, y_train: {y_train.shape}, y_test: {y_test.shape}"
     )
 
@@ -345,19 +370,34 @@ def main(config):
         config.train.pca_components,
         1,
     )
-    X_train = torch.tensor(X_train, dtype=torch.float32)
-    print(f"Reshaped X_train to: {X_train.shape}")
+    X_train = torch.tensor(X_train, dtype=torch.float32).to(device)
+    log.info(f"Reshaped X_train to: {X_train.shape}")
     X_train = X_train.permute(0, 4, 3, 1, 2)
-    print(f"Reshaped X_train to: {X_train.shape}")
-    y_train = torch.tensor(y_train, dtype=torch.long)
-    print(f"Reshaped y_train to: {y_train.shape}")
+    log.info(f"Reshaped X_train to: {X_train.shape}")
+    y_train = torch.tensor(y_train, dtype=torch.long).to(device)
+    log.info(f"Reshaped y_train to: {y_train.shape}")
 
     model = HybridSN(
         S=config.train.window_size,
         L=config.train.pca_components,
         out=int(torch.max(y_train) + 1),
     )
-    print(
+
+    torchinfo.summary(
+        model,
+        input_size=(
+            1,
+            1,
+            config.train.pca_components,
+            config.train.window_size,
+            config.train.window_size,
+        ),
+        col_names=["input_size", "output_size", "num_params"],
+        col_width=20,
+        row_settings=["var_names"],
+    )
+
+    log.info(
         f"Initialized HybridSN model with parameters: S={config.train.window_size}, L={config.train.pca_components}, out={int(torch.max(y_train) + 1)}"
     )
     train_ds = TensorDataset(X_train, y_train)
@@ -369,8 +409,11 @@ def main(config):
         drop_last=False,
     )
     test_ds = TensorDataset(
-        torch.tensor(X_test, dtype=torch.float32).permute(0, 3, 1, 2).unsqueeze(1),
-        torch.tensor(y_test, dtype=torch.long),
+        torch.tensor(X_test, dtype=torch.float32)
+        .to(device)
+        .permute(0, 3, 1, 2)
+        .unsqueeze(1),
+        torch.tensor(y_test, dtype=torch.long).to(device),
     )
     test_loader = DataLoader(
         test_ds,
@@ -416,14 +459,8 @@ def main(config):
             np.array2string(metrics["confusion"], max_line_width=200),
         ]
     )
-    print(summary)
 
-    report_path = os.path.join(
-        HydraConfig.get().runtime.output_dir, f"report_{dataset_name}.txt"
-    )
-    with open(report_path, "w") as f:
-        f.write(summary + "\n")
-    print(f"Saved report to {report_path}")
+    log.info(summary)
 
 
 # %%
