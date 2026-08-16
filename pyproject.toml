@@ -1,0 +1,17 @@
+[project]
+name = "hybridsn"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "hydra-core>=1.3.5",
+    "matplotlib>=3.10.9",
+    "numpy>=2.2.6",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.15.3",
+    "seaborn>=0.13.2",
+    "spectral>=0.25",
+    "torch>=2.13.0",
+    "tqdm>=4.70.0",
+]

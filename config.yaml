@@ -1,0 +1,12 @@
+train:
+  dataset: "sa"
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+  lr_decay_steps: 10000
+  lr_decay_rate: 0.9
+  window_size: 25
+  test_ratio: 0.7
+  random_state: 42
+  pca_components: 15
+  random_seed: 42
